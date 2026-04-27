@@ -604,12 +604,12 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         _accrueInterest(debtAsset);
 
-        // TODO:
         // 清算前必须检查 user 的健康因子 < 1e18。
-        // 下一步接入 AccountLogic / LiquidationLogic 后补上。
-        //
-        // uint256 hf = accountLogic.getHealthFactor(user);
-        // if (hf >= WAD) revert Errors.PositionNotLiquidatable(user, hf);
+        uint256 healthFactor = _getHealthFactor(user);
+
+        if (healthFactor >= WAD) {
+            revert Errors.PositionNotLiquidatable(user, healthFactor);
+        }
 
         DataTypes.UserReservePosition storage debtPosition = s_userPositions[
                     user
@@ -629,10 +629,12 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         uint256 actualRepay = repayAmount > maxClose ? maxClose : repayAmount;
 
-        // TODO:
-        // 当前是临时 mock 清算计算。
-        // 后续要用 PriceOracleAdapter + LiquidationLogic 替换。
-        uint256 seizedCollateral = _mockCalculateSeizeAmount(actualRepay);
+        // 清算计算
+        uint256 seizedCollateral = _calculateSeizeAmount(
+            debtAsset,
+            collateralAsset,
+            actualRepay
+        );
 
         if (collateralPosition.supplied < seizedCollateral) {
             seizedCollateral = collateralPosition.supplied;
@@ -823,18 +825,47 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     }
 
     /**
-     * @notice 临时清算计算
+     * @notice 根据偿还债务数量计算清算人可获得的抵押品数量
      * @dev
-     * 当前假设债务资产和抵押资产 1:1，
-     * 并给清算人 5% 奖励。
+     * 计算逻辑：
      *
-     * 后续必须替换为：
-     * PriceOracleAdapter + LiquidationLogic。
+     * 1. 把 repayAmount 换算成 USD 价值
+     * 2. 乘以抵押资产的 liquidationBonusBps
+     * 3. 再用抵押资产价格反算成 collateralAsset 数量
+     *
+     * 示例：
+     * - 清算人偿还 1000 USDC
+     * - USDC = 1 USD
+     * - repayValue = 1000 USD
+     * - liquidationBonus = 10500，也就是 105%
+     * - seizeValue = 1050 USD
+     * - WETH 当前价格 = 2000 USD
+     * - seizedCollateral = 1050 / 2000 = 0.525 WETH
      */
-    function _mockCalculateSeizeAmount(
+    function _calculateSeizeAmount(
+        address debtAsset,
+        address collateralAsset,
         uint256 repayAmount
-    ) internal pure returns (uint256) {
-        return (repayAmount * 105) / 100;
+    ) internal view returns (uint256) {
+        uint256 repayValue = _assetAmountToUsdValue(debtAsset, repayAmount);
+
+        DataTypes.MarketConfig memory collateralCfg = s_marketConfigs[
+                    collateralAsset
+            ];
+
+        uint256 seizeValue = (repayValue *
+            collateralCfg.liquidationBonusBps) / BPS;
+
+        (uint256 collateralPrice, ) = IPriceOracleAdapter(
+            collateralCfg.oracle
+        ).getAssetPrice(collateralAsset);
+
+        if (collateralPrice == 0) {
+            revert Errors.InvalidPrice(collateralAsset);
+        }
+
+        return
+                (seizeValue * (10 ** collateralCfg.decimals)) / collateralPrice;
     }
 
     /**

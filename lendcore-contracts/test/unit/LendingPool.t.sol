@@ -22,6 +22,7 @@ contract LendingPoolTest is Test {
     address internal admin = address(0xA11CE);
     address internal treasury = address(0xBEEF);
     address internal alice = address(0x1001);
+    address internal bob = address(0x2002);
 
     uint256 internal constant WETH_AMOUNT = 10 ether;
     uint256 internal constant USDC_LIQUIDITY = 100_000e6;
@@ -70,6 +71,9 @@ contract LendingPoolTest is Test {
 
         // 给 LendingPool 注入 USDC 流动性，供用户借出
         usdc.mint(address(pool), USDC_LIQUIDITY);
+
+        // 给 Bob 铸造 USDC，作为清算人资金
+        usdc.mint(bob, 10_000e6);
 
         vm.stopPrank();
     }
@@ -423,5 +427,157 @@ contract LendingPoolTest is Test {
         assertFalse(position.useAsCollateral);
 
         vm.stopPrank();
+    }
+
+    /**
+ * @notice 测试健康因子 >= 1 时不能清算
+     *
+     * 条件：
+     * - Alice 抵押 1 WETH
+     * - WETH = 3000 USD
+     * - Alice 借 1000 USDC
+     *
+     * 健康因子：
+     * - 3000 * 80% / 1000 = 2.4
+     *
+     * 预期：
+     * - Bob 尝试清算失败
+     */
+    function testLiquidateShouldRevertWhenHealthFactorIsSafe() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+        pool.borrow(address(usdc), 1000e6);
+
+        vm.stopPrank();
+
+        vm.startPrank(bob);
+
+        usdc.approve(address(pool), 500e6);
+
+        vm.expectPartialRevert(Errors.PositionNotLiquidatable.selector);
+        pool.liquidate(alice, address(usdc), address(weth), 500e6);
+
+        vm.stopPrank();
+    }
+
+    /**
+ * @notice 测试 WETH 价格下跌后，健康因子下降到 1 以下
+     *
+     * 条件：
+     * - Alice 抵押 1 WETH
+     * - 初始 WETH = 3000 USD
+     * - Alice 借 2000 USDC
+     *
+     * 初始健康因子：
+     * - 3000 * 80% / 2000 = 1.2
+     *
+     * WETH 下跌到 2000 USD 后：
+     * - 2000 * 80% / 2000 = 0.8
+     *
+     * 预期：
+     * - 健康因子 = 0.8e18
+     */
+    function testHealthFactorDropsBelowOneAfterPriceFalls() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+        pool.borrow(address(usdc), 2000e6);
+
+        vm.stopPrank();
+
+        oracle.setPrice(address(weth), 2000e8);
+
+        uint256 healthFactor = pool.getHealthFactor(alice);
+
+        assertEq(healthFactor, 0.8e18);
+    }
+
+    /**
+ * @notice 测试价格下跌后清算成功
+     *
+     * 条件：
+     * - Alice 抵押 1 WETH
+     * - Alice 借 2000 USDC
+     * - WETH 从 3000 USD 跌到 2000 USD
+     * - Bob 清算 1000 USDC
+     *
+     * 清算计算：
+     * - repayValue = 1000 USD
+     * - liquidationBonus = 105%
+     * - seizeValue = 1050 USD
+     * - WETH price = 2000 USD
+     * - seizedCollateral = 1050 / 2000 = 0.525 WETH
+     *
+     * 预期：
+     * - Alice 债务从 2000 USDC 降到 1000 USDC
+     * - Alice 抵押从 1 WETH 降到 0.475 WETH
+     * - Bob 获得 0.525 WETH
+     */
+    function testLiquidateSuccessAfterPriceFalls() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+        pool.borrow(address(usdc), 2000e6);
+
+        vm.stopPrank();
+
+        oracle.setPrice(address(weth), 2000e8);
+
+        vm.startPrank(bob);
+
+        usdc.approve(address(pool), 1000e6);
+        pool.liquidate(alice, address(usdc), address(weth), 1000e6);
+
+        vm.stopPrank();
+
+        DataTypes.UserReservePosition memory debtPosition = pool
+            .getUserPosition(alice, address(usdc));
+
+        DataTypes.UserReservePosition memory collateralPosition = pool
+            .getUserPosition(alice, address(weth));
+
+        assertEq(debtPosition.borrowed, 1000e6);
+        assertEq(collateralPosition.supplied, 0.475 ether);
+        assertEq(weth.balanceOf(bob), 0.525 ether);
+    }
+
+    /**
+ * @notice 测试单次清算最多只能清算 50% 债务
+     *
+     * 条件：
+     * - Alice 借 2000 USDC
+     * - 价格下跌后可清算
+     * - Bob 尝试清算 2000 USDC
+     *
+     * 预期：
+     * - 实际只清算 1000 USDC
+     * - Alice 剩余债务 1000 USDC
+     */
+    function testLiquidateShouldRespectCloseFactor() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+        pool.borrow(address(usdc), 2000e6);
+
+        vm.stopPrank();
+
+        oracle.setPrice(address(weth), 2000e8);
+
+        vm.startPrank(bob);
+
+        usdc.approve(address(pool), 2000e6);
+        pool.liquidate(alice, address(usdc), address(weth), 2000e6);
+
+        vm.stopPrank();
+
+        DataTypes.UserReservePosition memory debtPosition = pool
+            .getUserPosition(alice, address(usdc));
+
+        assertEq(debtPosition.borrowed, 1000e6);
     }
 }
