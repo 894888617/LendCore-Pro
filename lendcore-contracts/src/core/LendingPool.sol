@@ -8,6 +8,7 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
 import {ILendingPool} from "../interfaces/ILendingPool.sol";
 import {IPriceOracleAdapter} from "../interfaces/IPriceOracleAdapter.sol";
+import {IInterestRateModel} from "../interfaces/IInterestRateModel.sol";
 import {DataTypes} from "../libraries/DataTypes.sol";
 import {Errors} from "../libraries/Errors.sol";
 import {Events} from "../libraries/Events.sol";
@@ -70,6 +71,11 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
      * @dev V1 先固定为 50%，后续可改为市场参数。
      */
     uint256 internal constant MAX_LIQUIDATION_CLOSE_FACTOR_BPS = 5_000;
+
+    /**
+     * @notice 一年秒数，用于年化利率换算
+     */
+    uint256 internal constant SECONDS_PER_YEAR = 365 days;
 
     // ============================================================
     // Storage
@@ -535,7 +541,9 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         DataTypes.MarketState storage state = s_marketStates[asset];
 
-        position.borrowed += amount;
+        uint256 currentDebt = _getCurrentUserDebt(msg.sender, asset);
+
+        position.borrowed = currentDebt + amount;
         position.borrowIndexSnapshot = state.borrowIndex;
 
         state.totalBorrow += amount;
@@ -567,7 +575,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
                         msg.sender
             ][asset];
 
-        uint256 currentDebt = position.borrowed;
+        uint256 currentDebt = _getCurrentUserDebt(msg.sender, asset);
 
         if (currentDebt == 0) {
             revert Errors.NoDebt(msg.sender, asset);
@@ -578,6 +586,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         _transferIn(asset, msg.sender, actualRepaid);
 
         position.borrowed = currentDebt - actualRepaid;
+        position.borrowIndexSnapshot = s_marketStates[asset].borrowIndex;
         s_marketStates[asset].totalBorrow -= actualRepaid;
 
         emit Events.Repay(msg.sender, asset, actualRepaid);
@@ -620,12 +629,14 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
                     collateralAsset
             ];
 
-        if (debtPosition.borrowed == 0) {
+        uint256 currentDebt = _getCurrentUserDebt(user, debtAsset);
+
+        if (currentDebt == 0) {
             revert Errors.NoDebt(user, debtAsset);
         }
 
-        uint256 maxClose = (debtPosition.borrowed *
-            MAX_LIQUIDATION_CLOSE_FACTOR_BPS) / BPS;
+        uint256 maxClose = (currentDebt * MAX_LIQUIDATION_CLOSE_FACTOR_BPS) /
+                    BPS;
 
         uint256 actualRepay = repayAmount > maxClose ? maxClose : repayAmount;
 
@@ -642,7 +653,10 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         _transferIn(debtAsset, msg.sender, actualRepay);
 
-        debtPosition.borrowed -= actualRepay;
+        debtPosition.borrowed = currentDebt - actualRepay;
+        debtPosition.borrowIndexSnapshot = s_marketStates[debtAsset]
+            .borrowIndex;
+
         collateralPosition.supplied -= seizedCollateral;
 
         s_marketStates[debtAsset].totalBorrow -= actualRepay;
@@ -749,6 +763,20 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         return s_paused;
     }
 
+    /**
+     * @notice 查询用户某资产当前债务
+     * @dev 当前债务包含根据 borrowIndex 计算出来的利息。
+     * @param user 用户地址
+     * @param asset 借款资产地址
+     * @return currentDebt 当前债务数量
+     */
+    function getCurrentDebt(
+        address user,
+        address asset
+    ) external view returns (uint256 currentDebt) {
+        return _getCurrentUserDebt(user, asset);
+    }
+
     // ============================================================
     // Internal Functions
     // ============================================================
@@ -800,28 +828,110 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     }
 
     /**
-     * @notice 计提利息
+     * @notice 计提某资产市场的借款利息
      * @dev
-     * 当前只是占位。
-     * 下一阶段接入 InterestRateModel 后，
-     * 这里会根据时间差更新 borrowIndex / totalBorrow。
+     * 逻辑：
+     * 1. 根据当前时间计算距离上次结息经过了多少秒
+     * 2. 从利率模型读取当前借款年化利率
+     * 3. 计算这段时间产生的利息因子
+     * 4. 更新 borrowIndex
+     * 5. 更新 totalBorrow
+     *
+     * 注意：
+     * - 这里是 V1 简化版单利模型
+     * - 后续可以升级为更精细的指数累计模型
      */
     function _accrueInterest(address asset) internal {
         DataTypes.MarketState storage state = s_marketStates[asset];
 
-        if (state.lastAccrualTimestamp == block.timestamp) {
+        if (state.totalBorrow == 0) {
+            state.lastAccrualTimestamp = block.timestamp;
             return;
         }
 
-        // TODO:
-        // 1. 读取 InterestRateModel
-        // 2. 获取 borrowRate
-        // 3. 根据时间差计算利息
-        // 4. 更新 borrowIndex
-        // 5. 更新 totalBorrow
-        // 6. 更新 lastAccrualTimestamp
+        uint256 oldTimestamp = state.lastAccrualTimestamp;
+
+        if (oldTimestamp == block.timestamp) {
+            return;
+        }
+
+        uint256 elapsed = block.timestamp - oldTimestamp;
+
+        uint256 oldBorrowIndex = state.borrowIndex;
+        uint256 newBorrowIndex = _getProjectedBorrowIndex(asset);
+
+        state.borrowIndex = newBorrowIndex;
+
+        state.totalBorrow =
+            (state.totalBorrow * newBorrowIndex) /
+            oldBorrowIndex;
 
         state.lastAccrualTimestamp = block.timestamp;
+    }
+
+    /**
+     * @notice 计算某市场当前应该达到的 borrowIndex
+     * @dev
+     * 这是一个 view 函数，不修改状态。
+     *
+     * 如果当前时间已经晚于 lastAccrualTimestamp，
+     * 它会基于利率模型计算“理论上的最新 borrowIndex”。
+     */
+    function _getProjectedBorrowIndex(
+        address asset
+    ) internal view returns (uint256) {
+        DataTypes.MarketState memory state = s_marketStates[asset];
+
+        if (state.totalBorrow == 0) {
+            return state.borrowIndex;
+        }
+
+        if (state.lastAccrualTimestamp == block.timestamp) {
+            return state.borrowIndex;
+        }
+
+        uint256 elapsed = block.timestamp - state.lastAccrualTimestamp;
+
+        DataTypes.MarketConfig memory cfg = s_marketConfigs[asset];
+
+        uint256 totalLiquidity = IERC20(asset).balanceOf(address(this)) +
+                        state.totalBorrow;
+
+        uint256 borrowRate = IInterestRateModel(cfg.interestRateModel)
+            .getBorrowRate(asset, totalLiquidity, state.totalBorrow);
+
+        uint256 interestFactor = (borrowRate * elapsed) / SECONDS_PER_YEAR;
+
+        return (state.borrowIndex * (WAD + interestFactor)) / WAD;
+    }
+
+    /**
+     * @notice 获取用户当前债务
+     * @dev
+     * 用户 storage 中的 borrowed 可以理解为上一次交互后的债务快照。
+     * 当前债务需要根据 borrowIndex 变化重新换算。
+     */
+    function _getCurrentUserDebt(
+        address user,
+        address asset
+    ) internal view returns (uint256) {
+        DataTypes.UserReservePosition memory position = s_userPositions[user][
+                    asset
+            ];
+
+        if (position.borrowed == 0) {
+            return 0;
+        }
+
+        uint256 snapshot = position.borrowIndexSnapshot;
+
+        if (snapshot == 0) {
+            return position.borrowed;
+        }
+
+        uint256 currentBorrowIndex = _getProjectedBorrowIndex(asset);
+
+        return (position.borrowed * currentBorrowIndex) / snapshot;
     }
 
     /**
@@ -1008,11 +1118,13 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
                         user
                 ][asset];
 
-            if (position.borrowed == 0) {
+            uint256 currentDebt = _getCurrentUserDebt(user, asset);
+
+            if (currentDebt == 0) {
                 continue;
             }
 
-            uint256 value = _assetAmountToUsdValue(asset, position.borrowed);
+            uint256 value = _assetAmountToUsdValue(asset, currentDebt);
 
             totalDebtValue += value;
         }

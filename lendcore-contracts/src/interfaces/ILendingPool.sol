@@ -113,6 +113,17 @@ interface ILendingPool {
     returns (DataTypes.UserReservePosition memory);
 
     /**
+     * @notice 查询用户某资产当前债务
+     * @param user 用户地址
+     * @param asset 借款资产地址
+     * @return currentDebt 当前债务数量
+     */
+    function getCurrentDebt(
+        address user,
+        address asset
+    ) external view returns (uint256 currentDebt);
+
+    /**
      * @notice 查询某资产市场配置
      * @param asset 资产地址
      * @return 市场配置结构体

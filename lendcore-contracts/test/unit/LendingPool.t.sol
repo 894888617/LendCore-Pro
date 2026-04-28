@@ -6,6 +6,7 @@ import {Test} from "forge-std/Test.sol";
 import {LendingPool} from "../../src/core/LendingPool.sol";
 import {MockERC20} from "../../src/mocks/MockERC20.sol";
 import {MockOracle} from "../../src/mocks/MockOracle.sol";
+import {InterestRateModel} from "../../src/interest/InterestRateModel.sol";
 import {DataTypes} from "../../src/libraries/DataTypes.sol";
 import {Errors} from "../../src/libraries/Errors.sol";
 
@@ -18,6 +19,7 @@ contract LendingPoolTest is Test {
     MockERC20 internal weth;
     MockERC20 internal usdc;
     MockOracle internal oracle;
+    InterestRateModel internal rateModel;
 
     address internal admin = address(0xA11CE);
     address internal treasury = address(0xBEEF);
@@ -36,6 +38,12 @@ contract LendingPoolTest is Test {
         usdc = new MockERC20("Mock USDC", "mUSDC", 6);
         oracle = new MockOracle();
 
+        rateModel = new InterestRateModel(
+            0.02e18, // baseRate = 2%
+            0.20e18, // slope = 20%
+            0.10e18 // reserveFactor = 10%
+        );
+
         oracle.setPrice(address(weth), 3000e8);
         oracle.setPrice(address(usdc), 1e8);
 
@@ -48,7 +56,7 @@ contract LendingPoolTest is Test {
             liquidationBonusBps: 10500,
             decimals: 18,
             oracle: address(oracle),
-            interestRateModel: address(0x1234)
+            interestRateModel: address(rateModel)
         });
 
         DataTypes.MarketConfig memory usdcConfig = DataTypes.MarketConfig({
@@ -60,7 +68,7 @@ contract LendingPoolTest is Test {
             liquidationBonusBps: 10500,
             decimals: 6,
             oracle: address(oracle),
-            interestRateModel: address(0x1234)
+            interestRateModel: address(rateModel)
         });
 
         pool.initMarket(address(weth), wethConfig);
@@ -430,7 +438,7 @@ contract LendingPoolTest is Test {
     }
 
     /**
- * @notice 测试健康因子 >= 1 时不能清算
+     * @notice 测试健康因子 >= 1 时不能清算
      *
      * 条件：
      * - Alice 抵押 1 WETH
@@ -463,7 +471,7 @@ contract LendingPoolTest is Test {
     }
 
     /**
- * @notice 测试 WETH 价格下跌后，健康因子下降到 1 以下
+     * @notice 测试 WETH 价格下跌后，健康因子下降到 1 以下
      *
      * 条件：
      * - Alice 抵押 1 WETH
@@ -496,7 +504,7 @@ contract LendingPoolTest is Test {
     }
 
     /**
- * @notice 测试价格下跌后清算成功
+     * @notice 测试价格下跌后清算成功
      *
      * 条件：
      * - Alice 抵押 1 WETH
@@ -546,7 +554,7 @@ contract LendingPoolTest is Test {
     }
 
     /**
- * @notice 测试单次清算最多只能清算 50% 债务
+     * @notice 测试单次清算最多只能清算 50% 债务
      *
      * 条件：
      * - Alice 借 2000 USDC
@@ -579,5 +587,137 @@ contract LendingPoolTest is Test {
             .getUserPosition(alice, address(usdc));
 
         assertEq(debtPosition.borrowed, 1000e6);
+    }
+
+    /**
+     * @notice 测试线性利率模型
+     *
+     * 条件：
+     * - totalLiquidity = 100000 USDC
+     * - totalBorrow = 1000 USDC
+     * - utilization = 1%
+     * - baseRate = 2%
+     * - slope = 20%
+     *
+     * borrowRate = 2% + 1% * 20% = 2.2%
+     */
+    function testInterestRateModelBorrowRate() public view {
+        uint256 borrowRate = rateModel.getBorrowRate(
+            address(usdc),
+            100_000e6,
+            1000e6
+        );
+
+        assertEq(borrowRate, 0.022e18);
+    }
+
+    /**
+     * @notice 测试借款一年后债务增加
+     *
+     * 条件：
+     * - Alice 借 1000 USDC
+     * - 池子总流动性约 100000 USDC
+     * - 利用率 = 1%
+     * - 年化借款利率 = 2.2%
+     *
+     * 预期：
+     * - 一年后当前债务 = 1022 USDC
+     */
+    function testCurrentDebtIncreasesAfterOneYear() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+
+        pool.borrow(address(usdc), 1000e6);
+
+        vm.warp(block.timestamp + 365 days);
+
+        uint256 currentDebt = pool.getCurrentDebt(alice, address(usdc));
+
+        assertEq(currentDebt, 1022e6);
+
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice 测试还款时会先结算利息
+     *
+     * 条件：
+     * - Alice 借 1000 USDC
+     * - 一年后债务变成 1022 USDC
+     * - Alice 还款 1100 USDC
+     *
+     * 预期：
+     * - 实际只还 1022 USDC
+     * - 债务归零
+     */
+    function testRepayAfterInterestAccrual() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+
+        pool.borrow(address(usdc), 1000e6);
+
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 365 days);
+
+        // 给 Alice 额外 mint 一些 USDC 用来支付利息
+        usdc.mint(alice, 100e6);
+
+        vm.startPrank(alice);
+
+        usdc.approve(address(pool), 1100e6);
+
+        uint256 actualRepaid = pool.repay(address(usdc), 1100e6);
+
+        assertEq(actualRepaid, 1022e6);
+
+        uint256 currentDebt = pool.getCurrentDebt(alice, address(usdc));
+
+        assertEq(currentDebt, 0);
+
+        vm.stopPrank();
+    }
+
+    /**
+     * @notice 测试计息后还款，市场总债务也会正确更新
+     *
+     * 流程：
+     * - Alice 借 1000 USDC
+     * - 一年后市场债务应计息
+     * - Alice 还 22 USDC 利息部分
+     *
+     * 预期：
+     * - 市场 totalBorrow 接近 1000 USDC
+     */
+    function testMarketTotalBorrowAfterInterestRepay() public {
+        vm.startPrank(alice);
+
+        weth.approve(address(pool), 1 ether);
+        pool.deposit(address(weth), 1 ether, true);
+
+        pool.borrow(address(usdc), 1000e6);
+
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 365 days);
+
+        usdc.mint(alice, 22e6);
+
+        vm.startPrank(alice);
+
+        usdc.approve(address(pool), 22e6);
+        pool.repay(address(usdc), 22e6);
+
+        vm.stopPrank();
+
+        DataTypes.MarketState memory state = pool.getMarketState(
+            address(usdc)
+        );
+
+        assertEq(state.totalBorrow, 1000e6);
     }
 }
