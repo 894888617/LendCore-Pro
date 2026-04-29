@@ -150,4 +150,29 @@ library Errors {
         uint256 requestedValue,
         uint256 availableValue
     );
+
+    /**
+     * @notice 价格源未配置
+     * @param asset 资产地址
+     */
+    error PriceFeedNotSet(address asset);
+
+    /**
+     * @notice 价格过期
+     * @param asset 资产地址
+     * @param updatedAt 价格更新时间
+     */
+    error StalePrice(address asset, uint256 updatedAt);
+
+    /**
+     * @notice 价格源返回轮次异常
+     * @param asset 资产地址
+     */
+    error InvalidPriceRound(address asset);
+
+    /**
+     * @notice 调用者不是 PoolConfigurator
+     * @param caller 调用者地址
+     */
+    error NotPoolConfigurator(address caller);
 }

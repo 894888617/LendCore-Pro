@@ -97,4 +97,17 @@ interface IAccountLogic {
         address asset,
         uint256 amount
     ) external view returns (uint256);
+
+    /**
+     * @notice
+     */
+    function getHealthFactorAfterDisableCollateral(
+        address user,
+        address disabledAsset
+    ) external view returns (uint256);
+
+    function getAssetValue(
+        address asset,
+        uint256 amount
+    ) external view returns (uint256);
 }

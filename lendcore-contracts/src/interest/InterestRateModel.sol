@@ -57,7 +57,7 @@ contract InterestRateModel is IInterestRateModel {
      * @param totalBorrow 总借款
      * @return utilization 利用率，WAD 精度
      */
-    function getUtilizationRate( 
+    function getUtilizationRate(
         uint256 totalLiquidity,
         uint256 totalBorrow
     ) public pure returns (uint256 utilization) {
@@ -111,7 +111,7 @@ contract InterestRateModel is IInterestRateModel {
         uint256 utilization = getUtilizationRate(totalSupply, totalBorrow);
 
         return
-                (((borrowRate * utilization) / WAD) *
-                    (WAD - reserveFactor)) / WAD;
+                (borrowRate * utilization * (WAD - reserveFactor)) /
+                (WAD * WAD);
     }
 }

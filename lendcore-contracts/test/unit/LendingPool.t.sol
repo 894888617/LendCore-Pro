@@ -5,8 +5,10 @@ import {Test} from "forge-std/Test.sol";
 
 import {LendingPool} from "../../src/core/LendingPool.sol";
 import {MockERC20} from "../../src/mocks/MockERC20.sol";
-import {MockOracle} from "../../src/mocks/MockOracle.sol";
+import {PriceOracleAdapter} from "../../src/oracle/PriceOracleAdapter.sol";
+import {MockAggregatorV3} from "../../src/mocks/MockAggregatorV3.sol";
 import {InterestRateModel} from "../../src/interest/InterestRateModel.sol";
+import {PoolConfigurator} from "../../src/core/PoolConfigurator.sol";
 import {DataTypes} from "../../src/libraries/DataTypes.sol";
 import {Errors} from "../../src/libraries/Errors.sol";
 
@@ -18,8 +20,11 @@ contract LendingPoolTest is Test {
     LendingPool internal pool;
     MockERC20 internal weth;
     MockERC20 internal usdc;
-    MockOracle internal oracle;
+    PriceOracleAdapter internal oracle;
+    MockAggregatorV3 internal wethFeed;
+    MockAggregatorV3 internal usdcFeed;
     InterestRateModel internal rateModel;
+    PoolConfigurator internal configurator;
 
     address internal admin = address(0xA11CE);
     address internal treasury = address(0xBEEF);
@@ -33,10 +38,14 @@ contract LendingPoolTest is Test {
         vm.startPrank(admin);
 
         pool = new LendingPool(admin, treasury);
+        configurator = PoolConfigurator(pool.getPoolConfigurator());
 
         weth = new MockERC20("Wrapped Ether", "WETH", 18);
         usdc = new MockERC20("Mock USDC", "mUSDC", 6);
-        oracle = new MockOracle();
+        oracle = new PriceOracleAdapter(admin, 1 days);
+
+        wethFeed = new MockAggregatorV3(8, 3000e8);
+        usdcFeed = new MockAggregatorV3(8, 1e8);
 
         rateModel = new InterestRateModel(
             0.02e18, // baseRate = 2%
@@ -44,8 +53,8 @@ contract LendingPoolTest is Test {
             0.10e18 // reserveFactor = 10%
         );
 
-        oracle.setPrice(address(weth), 3000e8);
-        oracle.setPrice(address(usdc), 1e8);
+        oracle.setPriceFeed(address(weth), address(wethFeed));
+        oracle.setPriceFeed(address(usdc), address(usdcFeed));
 
         DataTypes.MarketConfig memory wethConfig = DataTypes.MarketConfig({
             isListed: true,
@@ -71,8 +80,8 @@ contract LendingPoolTest is Test {
             interestRateModel: address(rateModel)
         });
 
-        pool.initMarket(address(weth), wethConfig);
-        pool.initMarket(address(usdc), usdcConfig);
+        configurator.initMarket(address(weth), wethConfig);
+        configurator.initMarket(address(usdc), usdcConfig);
 
         // 给 Alice 铸造 WETH 作为抵押品
         weth.mint(alice, WETH_AMOUNT);
@@ -496,7 +505,7 @@ contract LendingPoolTest is Test {
 
         vm.stopPrank();
 
-        oracle.setPrice(address(weth), 2000e8);
+        wethFeed.setAnswer(2000e8);
 
         uint256 healthFactor = pool.getHealthFactor(alice);
 
@@ -533,7 +542,7 @@ contract LendingPoolTest is Test {
 
         vm.stopPrank();
 
-        oracle.setPrice(address(weth), 2000e8);
+        wethFeed.setAnswer(2000e8);
 
         vm.startPrank(bob);
 
@@ -574,7 +583,7 @@ contract LendingPoolTest is Test {
 
         vm.stopPrank();
 
-        oracle.setPrice(address(weth), 2000e8);
+        wethFeed.setAnswer(2000e8);
 
         vm.startPrank(bob);
 

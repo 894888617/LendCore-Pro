@@ -9,6 +9,10 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ILendingPool} from "../interfaces/ILendingPool.sol";
 import {IPriceOracleAdapter} from "../interfaces/IPriceOracleAdapter.sol";
 import {IInterestRateModel} from "../interfaces/IInterestRateModel.sol";
+import {LiquidationLogic} from "../logic/LiquidationLogic.sol";
+import {IAccountLogic} from "../interfaces/IAccountLogic.sol";
+import {AccountLogic} from "../logic/AccountLogic.sol";
+import {PoolConfigurator} from "./PoolConfigurator.sol";
 import {DataTypes} from "../libraries/DataTypes.sol";
 import {Errors} from "../libraries/Errors.sol";
 import {Events} from "../libraries/Events.sol";
@@ -70,7 +74,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
      * @notice 单次最大清算比例，5000 = 50%
      * @dev V1 先固定为 50%，后续可改为市场参数。
      */
-    uint256 internal constant MAX_LIQUIDATION_CLOSE_FACTOR_BPS = 5_000;
+    uint16 internal constant MAX_LIQUIDATION_CLOSE_FACTOR_BPS = 5_000;
 
     /**
      * @notice 一年秒数，用于年化利率换算
@@ -122,6 +126,21 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
      */
     bool internal s_paused;
 
+    /**
+     * @notice 清算逻辑模块地址
+     */
+    address internal s_liquidationLogic;
+
+    /**
+     * @notice 账户风险计算模块地址
+     */
+    address internal s_accountLogic;
+
+    /**
+     * @notice 市场配置入口模块地址
+     */
+    address internal s_poolConfigurator;
+
     // ============================================================
     // Constructor
     // ============================================================
@@ -141,6 +160,16 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         _grantRole(PAUSER_ROLE, admin);
 
         s_treasury = treasury_;
+        s_liquidationLogic = address(
+            new LiquidationLogic(MAX_LIQUIDATION_CLOSE_FACTOR_BPS)
+        );
+
+        s_accountLogic = address(new AccountLogic(address(this)));
+
+        s_poolConfigurator = address(new PoolConfigurator(address(this), admin));
+
+        _grantRole(CONFIG_ADMIN_ROLE, s_poolConfigurator);
+        _grantRole(PAUSER_ROLE, s_poolConfigurator);
     }
 
     // ============================================================
@@ -167,6 +196,16 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         _;
     }
 
+    /**
+     * @notice 只允许 PoolConfigurator 调用
+     */
+    modifier onlyPoolConfigurator() {
+        if (msg.sender != s_poolConfigurator) {
+            revert Errors.NotPoolConfigurator(msg.sender);
+        }
+        _;
+    }
+
     // ============================================================
     // Admin Functions
     // ============================================================
@@ -184,7 +223,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function initMarket(
         address asset,
         DataTypes.MarketConfig calldata config
-    ) external onlyRole(CONFIG_ADMIN_ROLE) {
+    ) external onlyPoolConfigurator {
         if (asset == address(0)) {
             revert Errors.ZeroAddress();
         }
@@ -219,7 +258,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setCollateralFactor(
         address asset,
         uint16 newFactorBps
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         DataTypes.MarketConfig storage cfg = s_marketConfigs[asset];
 
         if (
@@ -243,7 +282,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setLiquidationThreshold(
         address asset,
         uint16 newThresholdBps
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         DataTypes.MarketConfig storage cfg = s_marketConfigs[asset];
 
         if (
@@ -271,7 +310,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setLiquidationBonus(
         address asset,
         uint16 newBonusBps
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         if (newBonusBps < BPS) {
             revert Errors.InvalidLiquidationBonus(newBonusBps);
         }
@@ -292,7 +331,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setOracle(
         address asset,
         address oracle
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         if (oracle == address(0)) {
             revert Errors.InvalidOracle(oracle);
         }
@@ -313,7 +352,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setInterestRateModel(
         address asset,
         address model
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         if (model == address(0)) {
             revert Errors.InvalidInterestRateModel(model);
         }
@@ -332,7 +371,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setBorrowEnabled(
         address asset,
         bool enabled
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         s_marketConfigs[asset].isBorrowEnabled = enabled;
 
         emit Events.BorrowEnabledUpdated(asset, enabled);
@@ -344,16 +383,64 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function setCollateralEnabled(
         address asset,
         bool enabled
-    ) external onlyRole(CONFIG_ADMIN_ROLE) onlyListedMarket(asset) {
+    ) external onlyPoolConfigurator onlyListedMarket(asset) {
         s_marketConfigs[asset].isCollateralEnabled = enabled;
 
         emit Events.CollateralEnabledUpdated(asset, enabled);
     }
 
     /**
+     * @notice 设置清算逻辑模块地址
+     * @param newLiquidationLogic 新清算逻辑模块地址
+     */
+    function setLiquidationLogic(
+        address newLiquidationLogic
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newLiquidationLogic == address(0)) {
+            revert Errors.ZeroAddress();
+        }
+
+        s_liquidationLogic = newLiquidationLogic;
+    }
+
+    /**
+     * @notice 设置账户风险计算模块地址
+     * @param newAccountLogic 新账户逻辑模块地址
+     */
+    function setAccountLogic(
+        address newAccountLogic
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newAccountLogic == address(0)) {
+            revert Errors.ZeroAddress();
+        }
+
+        s_accountLogic = newAccountLogic;
+    }
+
+    /**
+     * @notice 设置新的 PoolConfigurator 地址
+     * @param newPoolConfigurator 新配置器地址
+     * @dev
+     * 后续如果要升级配置模块，可以通过该函数替换。
+     * 新配置器会获得 CONFIG_ADMIN_ROLE 和 PAUSER_ROLE。
+     */
+    function setPoolConfigurator(
+        address newPoolConfigurator
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newPoolConfigurator == address(0)) {
+            revert Errors.ZeroAddress();
+        }
+
+        s_poolConfigurator = newPoolConfigurator;
+
+        _grantRole(CONFIG_ADMIN_ROLE, newPoolConfigurator);
+        _grantRole(PAUSER_ROLE, newPoolConfigurator);
+    }
+
+    /**
      * @notice 暂停协议
      */
-    function pauseProtocol() external onlyRole(PAUSER_ROLE) {
+    function pauseProtocol() external onlyPoolConfigurator {
         s_paused = true;
 
         emit Events.ProtocolPaused();
@@ -362,7 +449,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     /**
      * @notice 恢复协议
      */
-    function unpauseProtocol() external onlyRole(PAUSER_ROLE) {
+    function unpauseProtocol() external onlyPoolConfigurator {
         s_paused = false;
 
         emit Events.ProtocolUnpaused();
@@ -439,11 +526,8 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         // 如果该资产正在作为抵押品，需要检查提取后健康因子是否仍然安全。
         if (position.useAsCollateral) {
-            uint256 hfAfter = _getHealthFactorAfterWithdraw(
-                msg.sender,
-                asset,
-                amount
-            );
+            uint256 hfAfter = IAccountLogic(s_accountLogic)
+                .getHealthFactorAfterWithdraw(msg.sender, asset, amount);
 
             if (hfAfter < WAD) {
                 revert Errors.HealthFactorTooLow(msg.sender, hfAfter);
@@ -522,10 +606,14 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
             );
         }
 
-
         // 借款前必须检查借款后健康因子。
-        uint256 borrowValue = _assetAmountToUsdValue(asset, amount);
-        uint256 availableBorrowValue = _getAvailableBorrowValue(msg.sender);
+        uint256 borrowValue = IAccountLogic(s_accountLogic).getAssetValue(
+            asset,
+            amount
+        );
+
+        uint256 availableBorrowValue = IAccountLogic(s_accountLogic)
+            .getUserBorrowCapacity(msg.sender);
 
         if (borrowValue > availableBorrowValue) {
             revert Errors.InsufficientBorrowCapacity(
@@ -614,7 +702,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         _accrueInterest(debtAsset);
 
         // 清算前必须检查 user 的健康因子 < 1e18。
-        uint256 healthFactor = _getHealthFactor(user);
+        uint256 healthFactor = IAccountLogic(s_accountLogic).getHealthFactor(user);
 
         if (healthFactor >= WAD) {
             revert Errors.PositionNotLiquidatable(user, healthFactor);
@@ -640,11 +728,21 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         uint256 actualRepay = repayAmount > maxClose ? maxClose : repayAmount;
 
+        DataTypes.MarketConfig memory debtCfg = s_marketConfigs[debtAsset];
+        DataTypes.MarketConfig memory collateralCfg = s_marketConfigs[
+                    collateralAsset
+            ];
+
         // 清算计算
-        uint256 seizedCollateral = _calculateSeizeAmount(
+        uint256 seizedCollateral = LiquidationLogic(s_liquidationLogic)
+            .calculateSeizeAmountWithConfig(
+            collateralCfg.oracle,
             debtAsset,
             collateralAsset,
-            actualRepay
+            actualRepay,
+            debtCfg.decimals,
+            collateralCfg.decimals,
+            collateralCfg.liquidationBonusBps
         );
 
         if (collateralPosition.supplied < seizedCollateral) {
@@ -713,14 +811,14 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     }
 
     /**
- * @notice 查询用户总抵押价值
+     * @notice 查询用户总抵押价值
      * @param user 用户地址
      * @return collateralValue 用户总抵押价值，统一为 1e8 USD 精度
      */
     function getUserTotalCollateralValue(
         address user
     ) external view returns (uint256 collateralValue) {
-        return _getUserTotalCollateralValue(user);
+        return IAccountLogic(s_accountLogic).getUserTotalCollateralValue(user);
     }
 
     /**
@@ -731,7 +829,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function getUserTotalDebtValue(
         address user
     ) external view returns (uint256 debtValue) {
-        return _getUserTotalDebtValue(user);
+        return IAccountLogic(s_accountLogic).getUserTotalDebtValue(user);
     }
 
     /**
@@ -742,7 +840,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function getAvailableBorrowValue(
         address user
     ) external view returns (uint256 availableBorrowValue) {
-        return _getAvailableBorrowValue(user);
+        return IAccountLogic(s_accountLogic).getUserBorrowCapacity(user);
     }
 
     /**
@@ -753,7 +851,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function getHealthFactor(
         address user
     ) external view returns (uint256 healthFactor) {
-        return _getHealthFactor(user);
+        return IAccountLogic(s_accountLogic).getHealthFactor(user);
     }
 
     /**
@@ -775,6 +873,20 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         address asset
     ) external view returns (uint256 currentDebt) {
         return _getCurrentUserDebt(user, asset);
+    }
+
+    /**
+     * @notice 查询当前账户风险计算模块地址
+     */
+    function getAccountLogic() external view returns (address) {
+        return s_accountLogic;
+    }
+
+    /**
+     * @notice 查询当前 PoolConfigurator 地址
+     */
+    function getPoolConfigurator() external view returns (address) {
+        return s_poolConfigurator;
     }
 
     // ============================================================
@@ -844,18 +956,19 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     function _accrueInterest(address asset) internal {
         DataTypes.MarketState storage state = s_marketStates[asset];
 
+        uint256 currentTimestamp = block.timestamp;
+
         if (state.totalBorrow == 0) {
-            state.lastAccrualTimestamp = block.timestamp;
+            state.lastAccrualTimestamp = currentTimestamp;
             return;
         }
 
         uint256 oldTimestamp = state.lastAccrualTimestamp;
+        uint256 elapsed = currentTimestamp - oldTimestamp;
 
-        if (oldTimestamp == block.timestamp) {
+        if (elapsed == 0) {
             return;
         }
-
-        uint256 elapsed = block.timestamp - oldTimestamp;
 
         uint256 oldBorrowIndex = state.borrowIndex;
         uint256 newBorrowIndex = _getProjectedBorrowIndex(asset);
@@ -866,7 +979,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
             (state.totalBorrow * newBorrowIndex) /
             oldBorrowIndex;
 
-        state.lastAccrualTimestamp = block.timestamp;
+        state.lastAccrualTimestamp = currentTimestamp;
     }
 
     /**
@@ -886,11 +999,12 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
             return state.borrowIndex;
         }
 
-        if (state.lastAccrualTimestamp == block.timestamp) {
+        uint256 currentTimestamp = block.timestamp;
+        uint256 elapsed = currentTimestamp - state.lastAccrualTimestamp;
+
+        if (elapsed == 0) {
             return state.borrowIndex;
         }
-
-        uint256 elapsed = block.timestamp - state.lastAccrualTimestamp;
 
         DataTypes.MarketConfig memory cfg = s_marketConfigs[asset];
 
@@ -935,51 +1049,7 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     }
 
     /**
-     * @notice 根据偿还债务数量计算清算人可获得的抵押品数量
-     * @dev
-     * 计算逻辑：
-     *
-     * 1. 把 repayAmount 换算成 USD 价值
-     * 2. 乘以抵押资产的 liquidationBonusBps
-     * 3. 再用抵押资产价格反算成 collateralAsset 数量
-     *
-     * 示例：
-     * - 清算人偿还 1000 USDC
-     * - USDC = 1 USD
-     * - repayValue = 1000 USD
-     * - liquidationBonus = 10500，也就是 105%
-     * - seizeValue = 1050 USD
-     * - WETH 当前价格 = 2000 USD
-     * - seizedCollateral = 1050 / 2000 = 0.525 WETH
-     */
-    function _calculateSeizeAmount(
-        address debtAsset,
-        address collateralAsset,
-        uint256 repayAmount
-    ) internal view returns (uint256) {
-        uint256 repayValue = _assetAmountToUsdValue(debtAsset, repayAmount);
-
-        DataTypes.MarketConfig memory collateralCfg = s_marketConfigs[
-                    collateralAsset
-            ];
-
-        uint256 seizeValue = (repayValue *
-            collateralCfg.liquidationBonusBps) / BPS;
-
-        (uint256 collateralPrice, ) = IPriceOracleAdapter(
-            collateralCfg.oracle
-        ).getAssetPrice(collateralAsset);
-
-        if (collateralPrice == 0) {
-            revert Errors.InvalidPrice(collateralAsset);
-        }
-
-        return
-                (seizeValue * (10 ** collateralCfg.decimals)) / collateralPrice;
-    }
-
-    /**
- * @notice 将 token 数量换算成 USD 价值
+     * @notice 将 token 数量换算成 USD 价值
      * @dev
      * 返回值统一使用 1e8 USD 精度。
      *
@@ -1011,97 +1081,6 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
     }
 
     /**
-     * @notice 获取用户总抵押价值
-     * @dev
-     * 只统计 useAsCollateral = true 的资产。
-     * 返回值为 1e8 USD 精度。
-     */
-    function _getUserTotalCollateralValue(
-        address user
-    ) internal view returns (uint256 totalCollateralValue) {
-        uint256 len = s_listedMarkets.length;
-
-        for (uint256 i = 0; i < len; i++) {
-            address asset = s_listedMarkets[i];
-
-            DataTypes.UserReservePosition memory position = s_userPositions[
-                        user
-                ][asset];
-
-            if (!position.useAsCollateral || position.supplied == 0) {
-                continue;
-            }
-
-            uint256 value = _assetAmountToUsdValue(asset, position.supplied);
-
-            totalCollateralValue += value;
-        }
-    }
-
-    /**
-     * @notice 获取用户加权后的抵押价值
-     * @dev
-     * 用 collateralFactorBps 加权。
-     * 这个值用于判断用户最多能借多少钱。
-     */
-    function _getUserBorrowableCollateralValue(
-        address user
-    ) internal view returns (uint256 borrowableCollateralValue) {
-        uint256 len = s_listedMarkets.length;
-
-        for (uint256 i = 0; i < len; i++) {
-            address asset = s_listedMarkets[i];
-
-            DataTypes.UserReservePosition memory position = s_userPositions[
-                        user
-                ][asset];
-
-            if (!position.useAsCollateral || position.supplied == 0) {
-                continue;
-            }
-
-            DataTypes.MarketConfig memory cfg = s_marketConfigs[asset];
-
-            uint256 value = _assetAmountToUsdValue(asset, position.supplied);
-
-            borrowableCollateralValue +=
-                (value * cfg.collateralFactorBps) /
-                BPS;
-        }
-    }
-
-    /**
-     * @notice 获取用户按清算阈值加权后的抵押价值
-     * @dev
-     * 这个值用于计算健康因子。
-     */
-    function _getUserLiquidationAdjustedCollateralValue(
-        address user
-    ) internal view returns (uint256 adjustedCollateralValue) {
-        uint256 len = s_listedMarkets.length;
-
-        for (uint256 i = 0; i < len; i++) {
-            address asset = s_listedMarkets[i];
-
-            DataTypes.UserReservePosition memory position = s_userPositions[
-                        user
-                ][asset];
-
-            if (!position.useAsCollateral || position.supplied == 0) {
-                continue;
-            }
-
-            DataTypes.MarketConfig memory cfg = s_marketConfigs[asset];
-
-            uint256 value = _assetAmountToUsdValue(asset, position.supplied);
-
-            adjustedCollateralValue +=
-                (value * cfg.liquidationThresholdBps) /
-                BPS;
-        }
-    }
-
-    /**
      * @notice 获取用户总债务价值
      * @dev
      * 返回值为 1e8 USD 精度。
@@ -1113,10 +1092,6 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
 
         for (uint256 i = 0; i < len; i++) {
             address asset = s_listedMarkets[i];
-
-            DataTypes.UserReservePosition memory position = s_userPositions[
-                        user
-                ][asset];
 
             uint256 currentDebt = _getCurrentUserDebt(user, asset);
 
@@ -1130,106 +1105,6 @@ contract LendingPool is ILendingPool, ReentrancyGuard, AccessControl {
         }
     }
 
-    /**
-     * @notice 获取用户当前剩余可借价值
-     * @dev
-     * 可借额度 = 抵押价值 * 抵押因子 - 当前债务价值
-     */
-    function _getAvailableBorrowValue(
-        address user
-    ) internal view returns (uint256) {
-        uint256 borrowableCollateralValue = _getUserBorrowableCollateralValue(
-            user
-        );
-
-        uint256 debtValue = _getUserTotalDebtValue(user);
-
-        if (borrowableCollateralValue <= debtValue) {
-            return 0;
-        }
-
-        return borrowableCollateralValue - debtValue;
-    }
-
-    /**
-     * @notice 获取用户健康因子
-     * @dev
-     * healthFactor = liquidationAdjustedCollateralValue * 1e18 / debtValue
-     *
-     * 如果用户没有债务，返回 uint256 最大值，表示绝对安全。
-     */
-    function _getHealthFactor(
-        address user
-    ) internal view returns (uint256) {
-        uint256 debtValue = _getUserTotalDebtValue(user);
-
-        if (debtValue == 0) {
-            return type(uint256).max;
-        }
-
-        uint256 adjustedCollateralValue = _getUserLiquidationAdjustedCollateralValue(
-            user
-        );
-
-        return (adjustedCollateralValue * WAD) / debtValue;
-    }
-
-    /**
-     * @notice 模拟提取后的健康因子
-     */
-    function _getHealthFactorAfterWithdraw(
-        address user,
-        address asset,
-        uint256 withdrawAmount
-    ) internal view returns (uint256) {
-        uint256 debtValue = _getUserTotalDebtValue(user);
-
-        if (debtValue == 0) {
-            return type(uint256).max;
-        }
-
-        uint256 adjustedCollateralValue = 0;
-        uint256 len = s_listedMarkets.length;
-
-        for (uint256 i = 0; i < len; i++) {
-            address currentAsset = s_listedMarkets[i];
-
-            DataTypes.UserReservePosition memory position = s_userPositions[
-                        user
-                ][currentAsset];
-
-            if (!position.useAsCollateral || position.supplied == 0) {
-                continue;
-            }
-
-            uint256 suppliedAmount = position.supplied;
-
-            if (currentAsset == asset) {
-                if (withdrawAmount >= suppliedAmount) {
-                    suppliedAmount = 0;
-                } else {
-                    suppliedAmount = suppliedAmount - withdrawAmount;
-                }
-            }
-
-            if (suppliedAmount == 0) {
-                continue;
-            }
-
-            DataTypes.MarketConfig memory cfg = s_marketConfigs[currentAsset];
-
-            uint256 value = _assetAmountToUsdValue(
-                currentAsset,
-                suppliedAmount
-            );
-
-            adjustedCollateralValue +=
-                (value * cfg.liquidationThresholdBps) /
-                BPS;
-        }
-
-        return (adjustedCollateralValue * WAD) / debtValue;
-    }
 
     /**
      * @notice 模拟关闭某资产抵押后的健康因子
